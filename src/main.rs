@@ -1,478 +1,210 @@
-use std::io;
+use anyhow::{Context, Result};
+use chrono::{Local, NaiveDateTime, TimeZone};
+use prettytable::{row, Table};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use chrono::{Local, TimeZone};
-use serde::{Serialize, Deserialize};
-use std::fs::File;
-use std::io::{Read, Write};
-use regex::Regex;
-use prettytable::{Table, row};
-use chrono::NaiveDateTime;
 
-enum Command {
-    Help,
-    Edit,
-    Show,
-    NewTask,
-    Quit,
-    Unknown,
-}
+// --- Models ---
 
-#[derive(Serialize, Deserialize, Clone)]
-struct  Task {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Task {
     id: u64,
     name: String,
     description: String,
     progress: f64,
-    created_at: u64,
-    expired_at: u64,
-
+    created_at: u64, // Unix Timestamp
+    expired_at: u64, // Unix Timestamp
 }
 
-const TASK_PATH: &str = "tasks.json";
+// --- Task Manager Logic ---
 
-fn read_string(message: &str) -> String {
-    println!("{}", message);
+struct TaskManager {
+    tasks: Vec<Task>,
+    path: PathBuf,
+}
 
+impl TaskManager {
+    fn new(path: &str) -> Self {
+        let path = PathBuf::from(path);
+        let mut manager = TaskManager {
+            tasks: Vec::new(),
+            path,
+        };
+        let _ = manager.load_tasks();
+        manager
+    }
+
+    fn load_tasks(&mut self) -> Result<()> {
+        if !self.path.exists() {
+            self.tasks = Vec::new();
+            return Ok(());
+        }
+        let data = fs::read_to_string(&self.path).context("Failed to read task file")?;
+        self.tasks = serde_json::from_str(&data).context("Failed to parse task JSON")?;
+        Ok(())
+    }
+
+    fn save_tasks(&self) -> Result<()> {
+        let json = serde_json::to_string_pretty(&self.tasks)?;
+        let temp_path = self.path.with_extension("tmp");
+        fs::write(&temp_path, json)?;
+        fs::rename(temp_path, &self.path)?;
+        Ok(())
+    }
+
+    fn add_task(&mut self, name: String, description: String, progress: f64, expired_at: u64) -> Result<()> {
+        let id = self.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        self.tasks.push(Task { id, name, description, progress, created_at, expired_at });
+        self.save_tasks()
+    }
+
+    fn edit_task(&mut self, id: u64, name: String, description: String, progress: f64, expired_at: u64) -> Result<bool> {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            task.name = name;
+            task.description = description;
+            task.progress = progress;
+            task.expired_at = expired_at;
+            self.save_tasks()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn remove_expired(&mut self) -> Result<usize> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let initial_len = self.tasks.len();
+        self.tasks.retain(|t| t.expired_at > now);
+        let removed = initial_len - self.tasks.len();
+        if removed > 0 { self.save_tasks()?; }
+        Ok(removed)
+    }
+}
+
+// --- DateTime Utilities ---
+
+fn parse_date_to_timestamp(input: &str) -> Result<u64> {
+    // 1. Parse the string as a "Naive" datetime (no timezone yet)
+    let naive_dt = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S")
+        .context("Format must be YYYY-MM-DD HH:MM:SS")?;
+
+    // 2. Treat the naive input as the user's LOCAL time
+    let local_dt = Local.from_local_datetime(&naive_dt)
+        .single()
+        .context("Invalid local time (e.g., during DST switch)")?;
+
+    // 3. Return as UTC timestamp for storage
+    Ok(local_dt.timestamp() as u64)
+}
+
+fn timestamp_to_local_string(timestamp: u64) -> String {
+    // Convert UTC timestamp back to User's Local Time for display
+    Local.timestamp_opt(timestamp as i64, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "Invalid Date".to_string())
+}
+
+// --- CLI Helpers ---
+
+fn read_input(prompt: &str) -> String {
+    print!("{} ", prompt);
+    let _ = io::stdout().flush();
     let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .unwrap();
-
+    io::stdin().read_line(&mut input).expect("Failed to read line");
     input.trim().to_string()
 }
 
-fn timestamp_to_date(timestamp: u64) -> String {
-    let date = Local.timestamp_opt(timestamp as i64, 0)
-        .single()
-        .unwrap();
+// --- Application ---
 
-    date.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-fn find_last_id(path: &str) -> u64 {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return 0,
-    };
-
-    let mut content = String::new();
-    file.read_to_string(&mut content).unwrap();
-
-    if content.is_empty() {
-        return 0;
-    }
-
-    let tasks: Vec<Task> = match serde_json::from_str(&content) {
-        Ok(tasks) => tasks,
-        Err(_) => return 0,
-    };
-
-    tasks.iter()
-        .map(|task| task.id)
-        .max()
-        .unwrap_or(0)
-}
+enum Command { New, Show, Edit, Help, Quit, Unknown }
 
 impl Command {
-    fn from_input(input: &str) -> Self {
-        match input.trim().to_lowercase().as_str() {
-            "quit" | "exit" | "q" => Command::Quit,
-            "new" | "newtask" | "new_task" | "nt" => Command::NewTask,
-            "show" | "showtask" | "show_tasks" => Command::Show,
-            "edit" | "edittask" | "edit_tasks" => Command::Edit,
+    fn from_str(input: &str) -> Self {
+        match input.to_lowercase().as_str() {
+            "new" | "nt" => Command::New,
+            "show" | "ls" => Command::Show,
+            "edit" => Command::Edit,
             "help" | "h" => Command::Help,
+            "quit" | "q" | "exit" => Command::Quit,
             _ => Command::Unknown,
         }
     }
-    fn quit(){
-        println!("Bye!");
-    }
-    fn newtask() {
-
-        println!("New Task");
-
-        let title = read_string("Title:");
-        let description = read_string("Description:");
-
-        let progress = loop {
-            let input = read_string("Progress(number):");
-
-            match input.parse::<f64>() {
-                Ok(value) if (0.0..=100.0).contains(&value) => {
-                    break value;
-                }
-                _ => {
-                    println!("Invalid progress! Enter a number between 0 and 100.");
-                }
-            }
-        };
-
-        let expired = loop {
-            let input = read_string("Expire Time(YYYY-MM-DD HH:MM:SS):");
-
-            let re = Regex::new(
-                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
-            ).unwrap();
-
-            if !re.is_match(&input) {
-                println!("Invalid format!");
-                continue;
-            }
-
-            match NaiveDateTime::parse_from_str(
-                &input,
-                "%Y-%m-%d %H:%M:%S"
-            ) {
-                Ok(datetime) => {
-                    break datetime.and_utc().timestamp();
-                }
-                Err(_) => {
-                    println!("Invalid date!");
-                }
-            }
-        };
-
-        let task = Task::new_task(
-            title,
-            description,
-            progress,
-            expired as u64
-        );
-
-        Task::save_task(&task , &TASK_PATH)
-    }
-
-    fn edittask() {
-        println!("Edit Task");
-
-        let id = loop {
-            let input = read_string("Task ID:");
-
-            match input.parse::<u64>() {
-                Ok(value) => break value,
-                Err(_) => {
-                    println!("Invalid ID!");
-                }
-            }
-        };
-
-
-        let title = read_string("New Title:");
-
-        let description = read_string("New Description:");
-
-
-        let progress = loop {
-            let input = read_string("Progress(number):");
-
-            match input.parse::<f64>() {
-                Ok(value) if (0.0..=100.0).contains(&value) => {
-                    break value;
-                }
-                _ => {
-                    println!("Invalid progress! Enter a number between 0 and 100.");
-                }
-            }
-        };
-
-
-        let expired = loop {
-            let input = read_string("Expire Time(YYYY-MM-DD HH:MM:SS):");
-
-            let re = Regex::new(
-                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
-            ).unwrap();
-
-
-            if !re.is_match(&input) {
-                println!("Invalid format!");
-                continue;
-            }
-
-
-            match NaiveDateTime::parse_from_str(
-                &input,
-                "%Y-%m-%d %H:%M:%S"
-            ) {
-                Ok(datetime) => {
-                    break datetime.and_utc().timestamp();
-                }
-                Err(_) => {
-                    println!("Invalid date!");
-                }
-            }
-        };
-
-
-        Task::edit_task(
-            id,
-            title,
-            description,
-            progress,
-            expired as u64,
-            &TASK_PATH
-        );
-    }
-
-    fn showtasks(path: &str) {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => {
-                println!("No tasks found.");
-                return;
-            }
-        };
-
-        let mut content = String::new();
-        file.read_to_string(&mut content).unwrap();
-
-        if content.is_empty() {
-            println!("No tasks found.");
-            return;
-        }
-
-        let tasks: Vec<Task> = serde_json::from_str(&content).unwrap();
-
-
-        let mut table = Table::new();
-
-        table.add_row(row![
-        "ID",
-        "Name",
-        "Description",
-        "Progress",
-        "Created",
-        "Expired"
-    ]);
-
-
-        for task in tasks.iter() {
-            table.add_row(row![
-        task.id,
-        task.name,
-        task.description,
-        format!("{:.1}%", task.progress),
-        timestamp_to_date(task.created_at),
-        timestamp_to_date(task.expired_at)
-    ]);
-        }
-
-
-        table.printstd();
-    }
-    fn help(){
-        println!("
-            ================ TASK MANAGER ================
-
-            [ Show Tasks ]
-              show | showtask | show_tasks
-
-            [ New Task ]
-              new | newtask | new_task | nt
-
-            [ Edit Task ]
-              edit | edittask | edit_tasks
-
-            [ Quit ]
-              quit | exit | q
-
-            [ Help ]
-              help | h
-
-            ==============================================
-");
-    }
 }
 
-impl Task {
-    fn new_task(name: String, description: String, progress: f64, expired_at: u64) -> Self {
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let id = find_last_id(TASK_PATH) + 1;
-
-        let task = Task {
-            id,
-            name,
-            description,
-            progress,
-            created_at: timestamp,
-            expired_at,
-        };
-
-        task
-    }
-
-    fn edit_task(
-        id: u64,
-        name: String,
-        description: String,
-        progress: f64,
-        expired_at: u64,
-        path: &str,
-    ) {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => {
-                println!("Tasks file not found.");
-                return;
-            }
-        };
-
-        let mut content = String::new();
-        file.read_to_string(&mut content).unwrap();
-
-
-        let mut tasks: Vec<Task> = match serde_json::from_str(&content) {
-            Ok(tasks) => tasks,
-            Err(_) => {
-                println!("Invalid JSON.");
-                return;
-            }
-        };
-
-
-        let task = tasks.iter_mut().find(|task| task.id == id);
-
-
-        match task {
-            Some(task) => {
-                task.name = name;
-                task.description = description;
-                task.progress = progress;
-                task.expired_at = expired_at;
-            }
-
-            None => {
-                println!("Task with id {} not found!", id);
-                return;
-            }
-        }
-
-
-        let json = serde_json::to_string_pretty(&tasks).unwrap();
-
-        let mut file = File::create(path).unwrap();
-        file.write_all(json.as_bytes()).unwrap();
-
-
-        println!("Task {} updated successfully.", id);
-    }
-
-    fn save_task(task: &Task, path: &str) {
-        let mut tasks: Vec<Task> = Vec::new();
-
-        if let Ok(mut file) = File::open(path) {
-            let mut content = String::new();
-            file.read_to_string(&mut content).unwrap();
-
-            if !content.is_empty() {
-                tasks = serde_json::from_str(&content).unwrap();
-            }
-        }
-
-        tasks.push(task.clone());
-
-        let json = serde_json::to_string_pretty(&tasks).unwrap();
-
-        let mut file = File::create(path).unwrap();
-        file.write_all(json.as_bytes()).unwrap();
-    }
-
-    fn remove_expired_tasks(path: &str) {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => return,
-        };
-
-        let mut content = String::new();
-
-        if file.read_to_string(&mut content).is_err() {
-            return;
-        }
-
-        if content.is_empty() {
-            return;
-        }
-
-        let mut tasks: Vec<Task> = match serde_json::from_str(&content) {
-            Ok(tasks) => tasks,
-            Err(_) => {
-                println!("Invalid JSON.");
-                return;
-            }
-        };
-
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-
-        let old_count = tasks.len();
-
-
-        tasks.retain(|task| {
-            task.expired_at > now
-        });
-
-
-        let removed = old_count - tasks.len();
-
-
-        if removed > 0 {
-            println!("Removed {} expired task(s).", removed);
-        }
-
-
-        let json = serde_json::to_string_pretty(&tasks).unwrap();
-
-
-        let mut file = File::create(path).unwrap();
-
-        file.write_all(json.as_bytes()).unwrap();
-    }
-}
-
-fn main() {
-
-    Task::remove_expired_tasks(TASK_PATH);
+fn main() -> Result<()> {
+    let mut manager = TaskManager::new("tasks.json");
+    let _ = manager.remove_expired();
 
     println!(r#"
-          ______          __                 ________    ____
-         /_  __/___  ____/ /___             / ____/ /   /  _/
-          / / / __ \/ __  / __ \  ______   / /   / /    / /
-         / / / /_/ / /_/ / /_/ / |_____|  / /___/ /____/ /
-        /_/  \____/\__,_/\____/           \____/_____/___/
+        ██████ ▄▄▄  ▄▄▄▄   ▄▄▄           ▄▄▄▄ ▄▄    ▄▄
+          ██  ██▀██ ██▀██ ██▀██   ▄▄▄   ██▀▀▀ ██    ██
+          ██  ▀███▀ ████▀ ▀███▀         ▀████ ██▄▄▄ ██
     "#);
+
     loop {
-        let mut input = String::new();
-        println!("Please enter command:");
-        std::io::stdin().read_line(&mut input).unwrap();
-        match Command::from_input(&input) {
-            Command::NewTask => {
-                Command::newtask();
+        let input = read_input("\n>> Enter command (type 'help' to see available commands):");
+        if input.is_empty() { continue; }
+
+        match Command::from_str(&input) {
+            Command::Help => println!("Commands: new, show, edit, help, quit"),
+            Command::New => {
+                let title = read_input("Title:");
+                let desc = read_input("Description:");
+                let progress: f64 = read_input("Progress (0-100):").parse().unwrap_or(0.0);
+
+                let expired = loop {
+                    let date_str = read_input("Expire (YYYY-MM-DD HH:MM:SS):");
+                    match parse_date_to_timestamp(&date_str) {
+                        Ok(t) => break t,
+                        Err(e) => println!("Error: {}", e),
+                    }
+                };
+
+                manager.add_task(title, desc, progress, expired)?;
+                println!("Saved.");
             }
             Command::Show => {
-                Command::showtasks(TASK_PATH);
+                let mut table = Table::new();
+                table.add_row(row!["ID", "Name", "Description", "Progress", "Expires"]);
+                for t in &manager.tasks {
+                    table.add_row(row![
+                        t.id,
+                        t.name,
+                        t.description,
+                        format!("{:.1}%", t.progress),
+                        timestamp_to_local_string(t.expired_at)
+                    ]);
+                }
+                table.printstd();
             }
             Command::Edit => {
-                Command::edittask();
+                let id: u64 = read_input("Task ID:").parse().unwrap_or(0);
+                let title = read_input("New Title:");
+                let desc = read_input("New Description:");
+                let progress: f64 = read_input("New Progress:").parse().unwrap_or(0.0);
+                let expired = loop {
+                    let date_str = read_input("New Expire (YYYY-MM-DD HH:MM:SS):");
+                    match parse_date_to_timestamp(&date_str) {
+                        Ok(t) => break t,
+                        Err(e) => println!("Error: {}", e),
+                    }
+                };
+
+                if manager.edit_task(id, title, desc, progress, expired)? {
+                    println!("Updated.");
+                } else {
+                    println!("ID not found.");
+                }
             }
-            Command::Quit => {
-                Command::quit();
-                break;
-            },
-            Command::Help => {
-                Command::help();
-            }
-            Command::Unknown => {
-                println!("Unknown Command");
-            }
+            Command::Quit => break,
+            Command::Unknown => println!("Unknown command."),
         }
     }
+    Ok(())
 }
