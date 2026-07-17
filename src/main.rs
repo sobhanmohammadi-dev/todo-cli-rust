@@ -251,7 +251,7 @@ impl Command {
         task.id,
         task.name,
         task.description,
-        format!("{:.1}%", task.progress * 100.0),
+        format!("{:.1}%", task.progress),
         timestamp_to_date(task.created_at),
         timestamp_to_date(task.expired_at)
     ]);
@@ -407,6 +407,7 @@ fn main() {
             }
             Command::Quit => {
                 Command::quit();
+                break;
             },
             Command::Help => {
                 Command::help();
