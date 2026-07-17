@@ -381,9 +381,67 @@ impl Task {
         let mut file = File::create(path).unwrap();
         file.write_all(json.as_bytes()).unwrap();
     }
+
+    fn remove_expired_tasks(path: &str) {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+
+        let mut content = String::new();
+
+        if file.read_to_string(&mut content).is_err() {
+            return;
+        }
+
+        if content.is_empty() {
+            return;
+        }
+
+        let mut tasks: Vec<Task> = match serde_json::from_str(&content) {
+            Ok(tasks) => tasks,
+            Err(_) => {
+                println!("Invalid JSON.");
+                return;
+            }
+        };
+
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+
+        let old_count = tasks.len();
+
+
+        tasks.retain(|task| {
+            task.expired_at > now
+        });
+
+
+        let removed = old_count - tasks.len();
+
+
+        if removed > 0 {
+            println!("Removed {} expired task(s).", removed);
+        }
+
+
+        let json = serde_json::to_string_pretty(&tasks).unwrap();
+
+
+        let mut file = File::create(path).unwrap();
+
+        file.write_all(json.as_bytes()).unwrap();
+    }
 }
 
 fn main() {
+
+    Task::remove_expired_tasks(TASK_PATH);
+
     println!(r#"
           ______          __                 ________    ____
          /_  __/___  ____/ /___             / ____/ /   /  _/
